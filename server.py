@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Initialize the model
 gpt_model_type = 'gpt2'
-device = 'cpu'
+device = 'cpu' # TODO - support 'cuda' if GPU is available
 model = GPT.from_pretrained(gpt_model_type, dict(dropout=0.0))
 model.eval()
 model.to(device)
@@ -21,31 +21,45 @@ enc = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode(s, allowed_special={""})
 decode = lambda l: enc.decode(l)
 
+# Use profiler to track memory usage
 @app.route('/completions', methods=['POST'])
 @profile
 def completions():
     prompt = request.json['prompt']
     max_tokens = request.json.get('max_tokens', 100)
+    n = request.json.get('n', 1)
     temperature = request.json.get('temperature', 0.9)
     top_k = request.json.get('top_k', 50)
     stop_sequence = request.json.get('stop', None)
+    logprobs = request.json.get('logprobs', None)
 
     prompt_ids = encode(prompt)
     input_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     
     start_time = time.time()
     with torch.no_grad():
-        generated_ids = model.generate(input_tensor, max_tokens, temperature=temperature, top_k=top_k)
-    
-    generated_text = decode(generated_ids[0].tolist())
+        if logprobs is not None:
+            generated_sequences, logprobs_results = model.generate(input_tensor, max_tokens, temperature, top_k, stop_sequence, n, logprobs)
+        else:
+            generated_sequences = model.generate(input_tensor, max_tokens, temperature, top_k, stop_sequence, n)
 
-    # Truncate the text at the first occurrence of the stop string, if provided
-    if stop_sequence and stop_sequence in generated_text:
-        generated_text = generated_text.split(stop_sequence, 1)[0] + stop_sequence
-        
-    response = {'completed_text': generated_text}
+    choices = []
+    for i, sequence in enumerate(generated_sequences):
+        choice = {
+            "text": decode(sequence[0].tolist()),
+            "index": i
+        }
+        if logprobs is not None:
+            choice["logprobs"] = {
+                "top_logprobs": [logprobs_results[i]]
+            }
+        choices.append(choice)
+
+    response = {
+        "choices": choices
+    }
+
     end_time = time.time()
-
     response_time = end_time - start_time
     current_app.logger.info(f"Time taken for response: {response_time:.2f} seconds")
     

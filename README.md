@@ -195,6 +195,18 @@ $ python sample.py \
 
 If you'd like to sample from a model you trained, use the `--out_dir` to point the code appropriately. You can also prompt the model with some text from a file, e.g. `$ python sample.py --start=FILE:prompt.txt`.
 
+## http endpoint for completions
+This server runs on localhost:5000 and listens for POST requests on /completions.
+The request body should be a json object with the following fields:
+{
+    "prompt": "Once upon a time",
+    "max_tokens": 50,
+    "stop": ".",
+    "logprobs": 2,
+    "n": 3,
+}
+
+
 ## efficiency notes
 
 For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.

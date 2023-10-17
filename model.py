@@ -11,6 +11,7 @@ import math
 import inspect
 from dataclasses import dataclass
 
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -303,28 +304,64 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop=None, n=1, logprobs=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+        # Initialize the encoder/decoder
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={""})
+        decode = lambda l: enc.decode(l)
 
-        return idx
+        outputs = []
+        logprobs_results = []
+
+        for _ in range(n):
+            current_idx = idx.clone()
+
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = current_idx if current_idx.size(1) <= self.config.block_size else current_idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _ = self(idx_cond)
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                current_idx = torch.cat((current_idx, idx_next), dim=1)
+
+                if logprobs is not None:
+                    # Get the top tokens' log probabilities
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    sorted_logprobs = torch.nn.functional.log_softmax(sorted_logits, dim=-1)
+                    # Extract top 'logprobs' values and their associated tokens
+                    top_tokens = sorted_indices[:, :logprobs]
+                    top_logprobs_values = sorted_logprobs[:, :logprobs]
+                    # Convert the logprobs to the desired format
+                    logprobs_data = []
+                    for tokens, values in zip(top_tokens, top_logprobs_values):
+                        logprobs_data.append({decode([token.item()]): value.item() for token, value in zip(tokens, values)})
+
+                # Check for stop sequence and break if found
+                if stop:
+                    stop_tokens = encode(stop)
+                    if current_idx[0, -len(stop_tokens):].tolist() == stop_tokens:
+                        break
+
+            outputs.append(current_idx)
+            if logprobs is not None:
+                logprobs_results.append(logprobs_data)
+
+        if logprobs is not None:
+            return outputs, logprobs_results
+        else:
+            return outputs
