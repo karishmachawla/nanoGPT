@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from memory_profiler import profile
 
 import tiktoken
 import torch
@@ -304,6 +305,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
+    @profile
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop=None, n=1, logprobs=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
@@ -317,10 +319,10 @@ class GPT(nn.Module):
 
         outputs = []
         logprobs_results = []
+        responses = []
 
-        for _ in range(n):
+        for i in range(n):
             current_idx = idx.clone()
-
             for _ in range(max_new_tokens):
                 # if the sequence context is growing too long we must crop it at block_size
                 idx_cond = current_idx if current_idx.size(1) <= self.config.block_size else current_idx[:, -self.config.block_size:]
@@ -334,6 +336,7 @@ class GPT(nn.Module):
                     logits[logits < v[:, [-1]]] = -float('Inf')
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = F.softmax(logits, dim=-1)
+
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1)
                 # append sampled index to the running sequence and continue
@@ -343,9 +346,11 @@ class GPT(nn.Module):
                     # Get the top tokens' log probabilities
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                     sorted_logprobs = torch.nn.functional.log_softmax(sorted_logits, dim=-1)
+
                     # Extract top 'logprobs' values and their associated tokens
                     top_tokens = sorted_indices[:, :logprobs]
                     top_logprobs_values = sorted_logprobs[:, :logprobs]
+
                     # Convert the logprobs to the desired format
                     logprobs_data = []
                     for tokens, values in zip(top_tokens, top_logprobs_values):
@@ -357,11 +362,14 @@ class GPT(nn.Module):
                     if current_idx[0, -len(stop_tokens):].tolist() == stop_tokens:
                         break
 
-            outputs.append(current_idx)
+            response = {
+                "index": i,
+                "text": decode(current_idx[0].tolist())
+            }
             if logprobs is not None:
-                logprobs_results.append(logprobs_data)
+                response["logprobs"] = {
+                    "top_logprobs": logprobs_data
+                }
+            responses.append(response)
 
-        if logprobs is not None:
-            return outputs, logprobs_results
-        else:
-            return outputs
+        return responses
