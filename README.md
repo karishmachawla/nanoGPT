@@ -204,6 +204,7 @@ The request body should be a json object with the following fields:
     "stop": ".",
     "logprobs": 2,
     "n": 3,
+    "model": "gpt2-medium",
 }
 
 
