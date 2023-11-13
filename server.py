@@ -1,7 +1,8 @@
-import logging
 import time
 from contextlib import nullcontext
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel # NEW
+from concurrent.futures import ThreadPoolExecutor
 from memory_profiler import profile
 
 from model import GPT
@@ -29,8 +30,8 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+app = FastAPI()
+executor = ThreadPoolExecutor()
 
 # Initialize model from a given GPT-2 model
 @profile
@@ -38,9 +39,15 @@ def load_model(model_type=default_model_type):
     start = time.time()
     model = GPT.from_pretrained(model_type, dict(dropout=0.0))
     model.eval()
+
+    # Check if multiple GPUs are available and wrap the model with DataParallel
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
+
     model.to(device)
     if compile:
-        model = torch.compile(model) # requires PyTorch 2.0 (optional)
+        model = torch.compile(model)
     end = time.time()
     load_time = end - start
     print(f"Time taken to load the model: {load_time:.2f} seconds")
@@ -66,47 +73,41 @@ def get_model(model_type):
 enc = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode(s, allowed_special={""})
 
-@app.route('/completions', methods=['POST'])
-def completions():
-    data = request.json
+class CompletionRequest(BaseModel):
+    prompt: str
+    max_tokens: int = default_max_tokens
+    temperature: float = default_temperature
+    top_k: int = default_top_k
+    stop: str = None
+    logprobs: int = None
+    n: int = default_num_samples
+    model: str = default_model_type
 
-    # Extract parameters from the request
-    prompt = data.get('prompt')
-    max_tokens = data.get('max_tokens', default_max_tokens)
-    temperature = data.get('temperature', default_temperature)
-    top_k = data.get('top_k', default_top_k)
-    stop_sequence = request.json.get('stop', None)
-    logprobs = request.json.get('logprobs', None) # Include the log probabilities on the logprobs most likely tokens.
-    n = data.get('n', default_num_samples) # Number of completions to generate for each prompt.
-    model_type = data.get('model', default_model_type)
-
-    try:
-        model = get_model(model_type)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-    prompt_ids = encode(prompt)
-    input_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
-    
-    start = time.time()
+async def run_inference(model, input_tensor, max_tokens, temperature, top_k, stop_sequence, n, logprobs):
     with torch.no_grad():
         with ctx:
-            response = model.generate(input_tensor, max_tokens, temperature, top_k, stop_sequence, n, logprobs)
+            return model.generate(input_tensor, max_tokens, temperature, top_k, stop_sequence, n, logprobs)
 
+@app.post("/completions")
+async def completions(request: CompletionRequest, background_tasks: BackgroundTasks):
+    try:
+        model = get_model(request.model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    prompt_ids = encode(request.prompt)
+    input_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+
+    start = time.time()
+    response = await run_inference(model, input_tensor, request.max_tokens, request.temperature, request.top_k, request.stop, request.n, request.logprobs)
     end = time.time()
     inference_time = end - start
     print(f"Time taken for inference: {inference_time:.2f} seconds")
 
-    # Calculate Throughput
+    # Calculate throughput
     total_tokens = sum([len(r['text'].split()) for r in response])
     throughput = total_tokens / inference_time
-    print(f"Throughput: {throughput:.2f} tokens/sec")
+    print(f"Request Throughput: {throughput:.2f} tokens/sec")
 
-    result = {
-        "choices": response
-    }
-
-    return jsonify(result)
-
-if __name__ == '__main__':
-    app.run(port=5000)
+    result = {"choices": response}
+    return result
